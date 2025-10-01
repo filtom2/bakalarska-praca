@@ -1,0 +1,10 @@
+# venv
+venv_bp
+
+# jupyter checkpoints
+.ipynb_checkpoints/
+
+# exclude the dataset
+data/
+
+.DS_Store
