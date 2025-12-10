@@ -1,0 +1,424 @@
+Follow this guide to create a data extraction process that will extract images from a WSI into a .png and also extract appropriate annotations together from a .sqlite or .json file into a COCO format that will be compatible with training on our deformable detr with a pre-downloaded resnet50 backbone,
+
+Step 1: WSI Handling and Tissue Segmentation
+The goal here is to efficiently read the gigapixel image data and determine which regions contain relevant tissue, filtering out the vast white background. This is crucial for efficient training. 
+Recommended Tools:
+OpenSlide 
+
+Process:
+Read WSI: Use OpenSlide to access the WSI at a low magnification level (e.g., 2.5x or 5x) for speed.
+Tissue Mask Generation: Apply an algorithm (like simple LAB color thresholding) to create a mask that differentiates tissue from the white background.
+Stain Normalization: (Optional but highly recommended) Apply stain normalization to reduce color variations between different slides/batches, which improves model generalization. 
+Step 2: Annotation-Aware Patch Extraction 
+This step addresses your main issue: linking the JSON annotations to the extracted patches to ensure meaningful training data. 
+Best Practices for Patching:
+Filter Non-Informative Patches: Only extract patches that overlap significantly with the tissue mask generated in Step 1. Discard patches with less than a certain percentage (e.g., 10%) of tissue area.
+Ensure Annotation Presence (Positive Samples): When extracting training patches, ensure that patches intended as "positive" examples contain the target mitotic figures within the patch boundaries.
+Contextual Patching and Overlap: To prevent the model from simply guessing the center, extract patches with a defined overlap (e.g., 50%) and sample from across the entire WSI (within tissue regions). 
+Consistent Magnification and Size: Crucially, standardize the magnification level and the patch size (e.g., 256x256 pixels) used for training across all WSIs to ensure consistency.
+Integrating Annotations into Training
+The key is not just extracting the patches, but knowing where the annotations lie relative to each patch's coordinates.
+Coordinate Mapping: For every extracted patch, you must calculate the coordinates of the mitotic figures relative to the top-left corner of that specific patch.
+Data Loader Modification: Your custom data loader will provide the  neural network with the patch image and the list of corresponding bounding boxes (in patch-local coordinates) that are compatible with our deformable detr cloned from official github repository.
+Our mitos dataset authors provide a dataset loader in the dataset.py file this is it (but we can not use fastai only plain pytorch and they trained it with focalloss on a retinanet model):
+
+import numpy as np
+from random import randint
+import openslide
+from tqdm import tqdm
+import os
+from data_loader import *
+
+
+def sampling_func(y, **kwargs):
+    y_label = np.array(y[1])
+    h, w = kwargs['size']
+
+    _arbitrary_prob = 0.1
+    _mit_prob = 0.5
+    
+    sample_prob = np.array([_arbitrary_prob, 1-_arbitrary_prob-_mit_prob, _mit_prob])
+    
+    case = np.random.choice(3, p=sample_prob)
+    
+    
+    
+    bg_label = [0] if y_label.dtype == np.int64 else ["bg"]
+    classes = bg_label + kwargs['classes']
+    level_dimensions = kwargs['level_dimensions']
+    level = kwargs['level']
+    if ('bg_label_prob' in kwargs):
+        _bg_label_prob = kwargs['bg_label_prob']
+        if (_bg_label_prob>1.0):
+            raise ValueError('Probability needs to be <= 1.0.')
+    else:
+        _bg_label_prob = 0.0  # add a backgound label to sample complete random
+    
+    if ('strategy' in kwargs):
+        _strategy = kwargs['strategy']
+    else:
+        _strategy = 'normal'
+        
+    if ('set' in kwargs):
+        _set = kwargs['set']
+    else:
+        _set = 'training'
+
+    if ('negative_class' in kwargs):
+        _negative_class = kwargs['negative_class']
+    else:
+        _negative_class = 7 # hard examples
+
+        
+    _random_offset_scale = 0.5  # up to 50% offset to left and right of frame
+    xoffset = randint(-w, w) * _random_offset_scale
+    yoffset = randint(-h, h) * _random_offset_scale
+    coords = np.array(y[0])
+
+    slide_width, slide_height = level_dimensions[level]
+    
+    if (case==0):
+        if (_set == 'training'): # sample on upper part of image
+            xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h)
+        elif (_set == 'validation'): # sample on lower part of image
+            xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h) + int(slide_height/2)
+        elif (_set == 'test'):
+            xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), slide_height - h)
+    if (case==2): # mitosis
+        
+        ids = y_label == 1
+
+        if (_set == 'training'):
+            ids[coords[:,1]>slide_height/2] = 0 # lower part not allowed
+        elif (_set == 'validation'):
+            ids[coords[:,1]<slide_height/2] = 0 # upper part not allowed
+
+        if (np.count_nonzero(ids)<1):
+            if (_set == 'training'): # sample on upper part of image
+                xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h)
+            elif (_set == 'validation'): # sample on lower part of image
+                xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h) + int(slide_height/2)
+        else:
+            xmin, ymin, xmax, ymax = np.array(y[0])[ids][randint(0, np.count_nonzero(ids) - 1)]
+    if (case==1): #nonmitosis
+            annos = kwargs['annotations']
+            coords = np.array(annos[_negative_class]['bboxes'])
+            
+            ids = np.arange(len(coords))
+
+            if (_set == 'training'):
+                ids[coords[:,1]>slide_height/2] = 0 # lower part not allowed
+            elif (_set == 'validation'):
+                ids[coords[:,1]<slide_height/2] = 0 # upper part not allowed
+
+            if (np.count_nonzero(ids)<1):
+
+                if (_set == 'training'): # sample on upper part of image
+                    xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h)
+                elif (_set == 'validation'): # sample on lower part of image
+                    xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h) + int(slide_height/2)
+            else:
+                xmin, ymin, xmax, ymax = coords[ids][randint(0, np.count_nonzero(ids) - 1)]
+        
+    return int(xmin - w / 2 + xoffset), int(ymin - h / 2 +yoffset)
+
+
+def get_slides(slidelist_test:list, database:"Database", negative_class:int=7, basepath:str='WSI', size:int=256):
+
+
+    lbl_bbox=list()
+    files=list()
+    train_slides=list()
+    val_slides=list()
+
+    getslides = """SELECT uid, filename FROM Slides"""
+    for idx, (currslide, filename) in enumerate(tqdm(database.execute(getslides).fetchall(), desc='Loading slides .. ')):
+        if (str(currslide) in slidelist_test): # skip test slides
+            continue
+
+        database.loadIntoMemory(currslide)
+
+        slide_path = basepath + os.sep + filename
+
+        slide = openslide.open_slide(str(slide_path))
+
+        level = 0#slide.level_count - 1
+        level_dimension = slide.level_dimensions[level]
+        down_factor = slide.level_downsamples[level]
+
+        classes = {2: 1} # Map non-mitosis to background
+
+        labels, bboxes = [], []
+        annotations = dict()
+        for id, annotation in database.annotations.items():
+            annotation.r = 25
+            d = 2 * annotation.r / down_factor
+            x_min = (annotation.x1 - annotation.r) / down_factor
+            y_min = (annotation.y1 - annotation.r) / down_factor
+            x_max = x_min + d
+            y_max = y_min + d
+            if annotation.agreedClass not in annotations:
+                annotations[annotation.agreedClass] = dict()
+                annotations[annotation.agreedClass]['bboxes'] = list()
+                annotations[annotation.agreedClass]['label'] = list()
+
+            annotations[annotation.agreedClass]['bboxes'].append([int(x_min), int(y_min), int(x_max), int(y_max)])
+            annotations[annotation.agreedClass]['label'].append(annotation.agreedClass)
+
+            if annotation.agreedClass in classes:
+                label = classes[annotation.agreedClass]
+
+                bboxes.append([int(x_min), int(y_min), int(x_max), int(y_max)])
+                labels.append(label)
+
+        if len(bboxes) > 0:
+            lbl_bbox.append([bboxes, labels])
+            files.append(SlideContainer(file=slide_path, annotations=annotations, level=level, width=size, height=size, y=[bboxes, labels], sample_func=partial(sampling_func, set='training', negative_class=negative_class)))
+            train_slides.append(len(files)-1)
+
+            lbl_bbox.append([bboxes, labels])
+            files.append(SlideContainer(file=slide_path, annotations=annotations, level=level, width=size, height=size, y=[bboxes, labels], sample_func=partial(sampling_func, set='validation', negative_class=negative_class)))
+            val_slides.append(len(files)-1)
+
+    return lbl_bbox, train_slides,val_slides,files
+
+
+And this is sampling.py function source code from which you may infer number of classes e.g.:
+import numpy as np
+from random import randint
+import openslide
+from tqdm import tqdm
+import os
+from data_loader import *
+
+
+def sampling_func(y, **kwargs):
+    y_label = np.array(y[1])
+    h, w = kwargs['size']
+
+    _arbitrary_prob = 0.1
+    _mit_prob = 0.5
+    
+    sample_prob = np.array([_arbitrary_prob, 1-_arbitrary_prob-_mit_prob, _mit_prob])
+    
+    case = np.random.choice(3, p=sample_prob)
+    
+    
+    
+    bg_label = [0] if y_label.dtype == np.int64 else ["bg"]
+    classes = bg_label + kwargs['classes']
+    level_dimensions = kwargs['level_dimensions']
+    level = kwargs['level']
+    if ('bg_label_prob' in kwargs):
+        _bg_label_prob = kwargs['bg_label_prob']
+        if (_bg_label_prob>1.0):
+            raise ValueError('Probability needs to be <= 1.0.')
+    else:
+        _bg_label_prob = 0.0  # add a backgound label to sample complete random
+    
+    if ('strategy' in kwargs):
+        _strategy = kwargs['strategy']
+    else:
+        _strategy = 'normal'
+        
+    if ('set' in kwargs):
+        _set = kwargs['set']
+    else:
+        _set = 'training'
+
+    if ('negative_class' in kwargs):
+        _negative_class = kwargs['negative_class']
+    else:
+        _negative_class = 7 # hard examples
+
+        
+    _random_offset_scale = 0.5  # up to 50% offset to left and right of frame
+    xoffset = randint(-w, w) * _random_offset_scale
+    yoffset = randint(-h, h) * _random_offset_scale
+    coords = np.array(y[0])
+
+    slide_width, slide_height = level_dimensions[level]
+    
+    if (case==0):
+        if (_set == 'training'): # sample on upper part of image
+            xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h)
+        elif (_set == 'validation'): # sample on lower part of image
+            xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h) + int(slide_height/2)
+        elif (_set == 'test'):
+            xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), slide_height - h)
+    if (case==2): # mitosis
+        
+        ids = y_label == 1
+
+        if (_set == 'training'):
+            ids[coords[:,1]>slide_height/2] = 0 # lower part not allowed
+        elif (_set == 'validation'):
+            ids[coords[:,1]<slide_height/2] = 0 # upper part not allowed
+
+        if (np.count_nonzero(ids)<1):
+            if (_set == 'training'): # sample on upper part of image
+                xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h)
+            elif (_set == 'validation'): # sample on lower part of image
+                xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h) + int(slide_height/2)
+        else:
+            xmin, ymin, xmax, ymax = np.array(y[0])[ids][randint(0, np.count_nonzero(ids) - 1)]
+    if (case==1): #nonmitosis
+            annos = kwargs['annotations']
+            coords = np.array(annos[_negative_class]['bboxes'])
+            
+            ids = np.arange(len(coords))
+
+            if (_set == 'training'):
+                ids[coords[:,1]>slide_height/2] = 0 # lower part not allowed
+            elif (_set == 'validation'):
+                ids[coords[:,1]<slide_height/2] = 0 # upper part not allowed
+
+            if (np.count_nonzero(ids)<1):
+
+                if (_set == 'training'): # sample on upper part of image
+                    xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h)
+                elif (_set == 'validation'): # sample on lower part of image
+                    xmin, ymin = randint(int(w / 2 - xoffset), slide_width - w), randint(int(h / 2 - yoffset), int(slide_height/2) - h) + int(slide_height/2)
+            else:
+                xmin, ymin, xmax, ymax = coords[ids][randint(0, np.count_nonzero(ids) - 1)]
+        
+    return int(xmin - w / 2 + xoffset), int(ymin - h / 2 +yoffset)
+
+
+def get_slides(slidelist_test:list, database:"Database", negative_class:int=7, basepath:str='WSI', size:int=256):
+
+
+    lbl_bbox=list()
+    files=list()
+    train_slides=list()
+    val_slides=list()
+
+    getslides = """SELECT uid, filename FROM Slides"""
+    for idx, (currslide, filename) in enumerate(tqdm(database.execute(getslides).fetchall(), desc='Loading slides .. ')):
+        if (str(currslide) in slidelist_test): # skip test slides
+            continue
+
+        database.loadIntoMemory(currslide)
+
+        slide_path = basepath + os.sep + filename
+
+        slide = openslide.open_slide(str(slide_path))
+
+        level = 0#slide.level_count - 1
+        level_dimension = slide.level_dimensions[level]
+        down_factor = slide.level_downsamples[level]
+
+        classes = {2: 1} # Map non-mitosis to background
+
+        labels, bboxes = [], []
+        annotations = dict()
+        for id, annotation in database.annotations.items():
+            annotation.r = 25
+            d = 2 * annotation.r / down_factor
+            x_min = (annotation.x1 - annotation.r) / down_factor
+            y_min = (annotation.y1 - annotation.r) / down_factor
+            x_max = x_min + d
+            y_max = y_min + d
+            if annotation.agreedClass not in annotations:
+                annotations[annotation.agreedClass] = dict()
+                annotations[annotation.agreedClass]['bboxes'] = list()
+                annotations[annotation.agreedClass]['label'] = list()
+
+            annotations[annotation.agreedClass]['bboxes'].append([int(x_min), int(y_min), int(x_max), int(y_max)])
+            annotations[annotation.agreedClass]['label'].append(annotation.agreedClass)
+
+            if annotation.agreedClass in classes:
+                label = classes[annotation.agreedClass]
+
+                bboxes.append([int(x_min), int(y_min), int(x_max), int(y_max)])
+                labels.append(label)
+
+        if len(bboxes) > 0:
+            lbl_bbox.append([bboxes, labels])
+            files.append(SlideContainer(file=slide_path, annotations=annotations, level=level, width=size, height=size, y=[bboxes, labels], sample_func=partial(sampling_func, set='training', negative_class=negative_class)))
+            train_slides.append(len(files)-1)
+
+            lbl_bbox.append([bboxes, labels])
+            files.append(SlideContainer(file=slide_path, annotations=annotations, level=level, width=size, height=size, y=[bboxes, labels], sample_func=partial(sampling_func, set='validation', negative_class=negative_class)))
+            val_slides.append(len(files)-1)
+
+    return lbl_bbox, train_slides,val_slides,files
+
+
+
+so create the pre-processing scripts for our WSI with annotations and appropriately extract them into patches that will be compatible with our neural network, and make sure there are no bugs
+
+And we will be running this and extracting directly in azure as a job so keep the necesary wsi extraction files in the parent directory, thesubscription_id resource_group workspace_name are in the config.json file, and this is a sample script that correctly submits a job to azure with browser authentification so use it as an example, the enviroment compute name enviroment and input file are the same and the same also annotation file is the same as in the script. Here it is:
+
+
+from azure.ai.ml import command, Input, Output
+from azure.ai.ml import MLClient
+from azure.identity import InteractiveBrowserCredential
+from pathlib import Path
+
+# Configuration
+PATCHES_PER_SLIDE = 100  # Configurable - adjust for experiments
+PATCH_SIZE = 256
+TRAIN_VAL_SPLIT = 0.8
+COMPUTE_NAME = "xseligam-mitos-train"
+ENVIRONMENT = "xseligam_mitos:17"
+RAW_DATA_URI = "azureml:xseligam-ccmct-wsi:1"
+
+# Connect to Azure ML
+print("[INFO] Prihlasujem sa do Azure...")
+credential = InteractiveBrowserCredential(tenant_id="5dbf1add-202a-4b8d-815b-bf0fb024e033")
+ml_client = MLClient.from_config(credential=credential)
+
+# Get code directory
+code_dir = str(Path(__file__).parent.resolve())
+
+# Build command
+job = command(
+    code=code_dir,
+    
+    command=(
+        'bash -c "'
+        'set -e; set -x; '
+        'echo START; '
+        'ls -F \\"${{inputs.wsi_data}}\\"; '
+        'python -u extract_wsi_patches.py '
+        '--wsi_dir \\"${{inputs.wsi_data}}/WSI\\" '
+        '--annotation_json \\"${{inputs.wsi_data}}/databases/MITOS_WSI_CCMCT_HEAEL.json\\" '
+        '--output_dir \\"${{outputs.patch_dataset}}\\" '
+        '--patches_per_slide {patches_per_slide} '
+        '--patch_size {patch_size} '
+        '--train_val_split {train_val_split} '
+        '--seed 42; '
+        'echo DONE'
+        '"'
+    ).format(
+        patches_per_slide=PATCHES_PER_SLIDE,
+        patch_size=PATCH_SIZE,
+        train_val_split=TRAIN_VAL_SPLIT
+    ),
+    
+    inputs={
+        "wsi_data": Input(
+            type="uri_folder",
+            path=RAW_DATA_URI,
+            mode="ro_mount"
+        ),
+    },
+    
+    outputs={
+        "patch_dataset": Output(
+            type="uri_folder",
+            mode="upload"  # Upload mode automatically stores to Azure ML
+        ),
+    },
+    
+    environment=ENVIRONMENT,
+    compute=COMPUTE_NAME,
+    display_name=f"extract-patches-{PATCHES_PER_SLIDE}pps",
+    experiment_name="Mitos-Patch-Extraction",
+    )
+
+# Submit job
+print("WSI Patch Extraction Job")
+
+returned_job = ml_client.jobs.create_or_update(job)

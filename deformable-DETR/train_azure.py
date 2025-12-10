@@ -1,0 +1,319 @@
+"""
+Azure ML Training Script for Deformable-DETR Mitosis Detection
+Optimized for single V100 GPU with 134,000 images
+"""
+import argparse
+import datetime
+import json
+import random
+import time
+from pathlib import Path
+import os
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+import datasets
+import util.misc as utils
+import datasets.samplers as samplers
+from datasets import build_dataset, get_coco_api_from_dataset
+from engine import train_one_epoch, evaluate
+from models import build_model
+
+import wandb
+
+
+
+def get_args_parser():
+    parser = argparse.ArgumentParser('Deformable DETR for Mitosis Detection', add_help=False)
+    
+    # Azure ML paths
+    parser.add_argument('--data_path', type=str, required=True,
+                        help='Path to Azure ML dataset (contains train2017, val2017, annotations)')
+    parser.add_argument('--output_dir', type=str, required=True,
+                        help='Path to save outputs (checkpoints, logs)')
+    
+    # Training hyperparameters - optimized for V100 with 134k images
+    parser.add_argument('--batch_size', default=8, type=int,
+                        help='Batch size per GPU (V100 can handle 8-16)')
+    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--lr', default=2e-4, type=float,
+                        help='Learning rate')
+    parser.add_argument('--lr_backbone', default=2e-5, type=float,
+                        help='Backbone learning rate (10x lower)')
+    parser.add_argument('--lr_drop', default=40, type=int,
+                        help='LR drop epoch')
+    parser.add_argument('--weight_decay', default=1e-4, type=float)
+    parser.add_argument('--clip_max_norm', default=0.1, type=float,
+                        help='Gradient clipping max norm')
+    parser.add_argument('--num_workers', default=8, type=int)
+    
+    # Model architecture - optimized for speed on V100
+    parser.add_argument('--backbone', default='resnet50', type=str,
+                        help='Backbone architecture')
+    parser.add_argument('--num_queries', default=100, type=int,
+                        help='Number of query slots (reduced from 300 for speed)')
+    parser.add_argument('--num_feature_levels', default=4, type=int,
+                        help='Number of feature levels')
+    
+    # Transformer - balanced for speed and performance
+    parser.add_argument('--enc_layers', default=3, type=int,
+                        help='Number of encoding layers (reduced from 6 for speed)')
+    parser.add_argument('--dec_layers', default=3, type=int,
+                        help='Number of decoding layers (reduced from 6 for speed)')
+    parser.add_argument('--dim_feedforward', default=1024, type=int,
+                        help='FFN dimension')
+    parser.add_argument('--hidden_dim', default=256, type=int,
+                        help='Transformer dimension')
+    parser.add_argument('--dropout', default=0.1, type=float)
+    parser.add_argument('--nheads', default=8, type=int,
+                        help='Number of attention heads')
+    parser.add_argument('--dec_n_points', default=4, type=int)
+    parser.add_argument('--enc_n_points', default=4, type=int)
+    parser.add_argument('--last_height', default=16, type=int)
+    parser.add_argument('--last_width', default=16, type=int)
+    
+    # Position embedding
+    parser.add_argument('--position_embedding', default='sine', type=str,
+                        choices=('sine', 'learned'))
+    parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float)
+    
+    # Loss
+    parser.add_argument('--aux_loss', action='store_true', default=True,
+                        help='Auxiliary decoding losses')
+    
+    # Matcher
+    parser.add_argument('--set_cost_class', default=2, type=float)
+    parser.add_argument('--set_cost_bbox', default=5, type=float)
+    parser.add_argument('--set_cost_giou', default=2, type=float)
+    
+    # Loss coefficients
+    parser.add_argument('--cls_loss_coef', default=2, type=float)
+    parser.add_argument('--bbox_loss_coef', default=5, type=float)
+    parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--focal_alpha', default=0.25, type=float)
+    
+    # Dataset
+    parser.add_argument('--dataset_file', default='mitos', type=str)
+    
+    # Device
+    parser.add_argument('--device', default='cuda', help='device to use')
+    parser.add_argument('--seed', default=42, type=int)
+    
+    # Fixed parameters
+    parser.add_argument('--lr_backbone_names', default=["backbone.0"], type=str, nargs='+')
+    parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], 
+                        type=str, nargs='+')
+    parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
+    parser.add_argument('--dilation', action='store_true')
+    parser.add_argument('--cache_mode', default=False, action='store_true')
+    
+    return parser
+
+
+def main(args):
+    run_name = os.getenv('WANDB_RUN_NAME', f'deformable-detr-e{args.epochs}-bs{args.batch_size}')
+    wandb.init(
+        project=os.getenv('WANDB_PROJECT', 'Mitos_BP_DeformableDETR'),
+        name=run_name,
+        config=vars(args)
+        )
+    
+    print("="*80)
+    print("Deformable-DETR for Mitosis Detection")
+    print("="*80)
+    print(f"Data path: {args.data_path}")
+    print(f"Output dir: {args.output_dir}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Num queries: {args.num_queries}")
+    print(f"Encoder layers: {args.enc_layers}, Decoder layers: {args.dec_layers}")
+    print("="*80)
+    
+    device = torch.device(args.device)
+    args.pre_norm = False
+    
+    # Fix seed for reproducibility
+    seed = args.seed
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    # Build model
+    print("\n[INFO] Building model...")
+    model, criterion, postprocessors = build_model(args)
+    model.to(device)
+    
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'[INFO] Number of trainable parameters: {n_parameters:,}')
+    
+    # Build datasets
+    print(f"\n[INFO] Loading datasets from {args.data_path}...")
+    dataset_train = build_dataset(image_set='train', args=args)
+    dataset_val = build_dataset(image_set='val', args=args)
+    print(f"[INFO] Train size: {len(dataset_train)}, Val size: {len(dataset_val)}")
+    
+    # Data loaders
+    sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    
+    batch_sampler_train = torch.utils.data.BatchSampler(
+        sampler_train, args.batch_size, drop_last=True)
+    
+    data_loader_train = DataLoader(
+        dataset_train, 
+        batch_sampler=batch_sampler_train,
+        collate_fn=utils.collate_fn, 
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    data_loader_val = DataLoader(
+        dataset_val, 
+        args.batch_size, 
+        sampler=sampler_val,
+        drop_last=False, 
+        collate_fn=utils.collate_fn, 
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    
+    # Optimizer with different LR for backbone
+    def match_name_keywords(n, name_keywords):
+        out = False
+        for b in name_keywords:
+            if b in n:
+                out = True
+                break
+        return out
+    
+    param_dicts = [
+        {
+            "params": [p for n, p in model.named_parameters()
+                      if not match_name_keywords(n, args.lr_backbone_names) 
+                      and not match_name_keywords(n, args.lr_linear_proj_names) 
+                      and p.requires_grad],
+            "lr": args.lr,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() 
+                      if match_name_keywords(n, args.lr_backbone_names) and p.requires_grad],
+            "lr": args.lr_backbone,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() 
+                      if match_name_keywords(n, args.lr_linear_proj_names) and p.requires_grad],
+            "lr": args.lr * args.lr_linear_proj_mult,
+        }
+    ]
+    
+    optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    
+    # Prepare output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get COCO evaluator
+    base_ds = get_coco_api_from_dataset(dataset_val)
+    
+    # Training loop
+    print("\n" + "="*80)
+    print("Starting Training")
+    print("="*80)
+    start_time = time.time()
+    best_map = 0.0
+    
+    for epoch in range(args.epochs):
+        print(f"\n{'='*80}")
+        print(f"Epoch {epoch+1}/{args.epochs}")
+        print(f"{'='*80}")
+        
+        # Train
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm
+        )
+        lr_scheduler.step()
+        
+        # Save checkpoint
+        checkpoint_path = output_dir / 'checkpoint.pth'
+        torch.save({
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            'epoch': epoch,
+            'args': args,
+        }, checkpoint_path)
+        
+        # Evaluate
+        test_stats, coco_evaluator = evaluate(
+            model, criterion, postprocessors, data_loader_val, base_ds, device, str(output_dir)
+        )
+        
+        # Extract metrics
+        map_50 = test_stats.get('coco_eval_bbox', [0]*12)[1]  # AP@50
+        map_75 = test_stats.get('coco_eval_bbox', [0]*12)[2]  # AP@75
+        map_avg = test_stats.get('coco_eval_bbox', [0]*12)[0]  # AP@[.5:.95]
+        
+        print(f"\n[Epoch {epoch+1}] Train Loss: {train_stats['loss']:.4f}")
+        print(f"[Epoch {epoch+1}] Val mAP@50: {map_50:.4f}, mAP@75: {map_75:.4f}, mAP: {map_avg:.4f}")
+        
+        # Log to WandB
+        log_dict = {
+            "epoch": epoch + 1,
+            "train/loss": train_stats['loss'],
+            "train/lr": optimizer.param_groups[0]["lr"],
+            "val/mAP": map_avg,
+            "val/mAP_50": map_50,
+            "val/mAP_75": map_75,
+        }
+        # Add all train stats
+        for k, v in train_stats.items():
+            if k != 'loss':
+                log_dict[f"train/{k}"] = v
+        # Add all test stats
+        for k, v in test_stats.items():
+            if k != 'coco_eval_bbox' and isinstance(v, (int, float)):
+                log_dict[f"val/{k}"] = v
+        
+        wandb.log(log_dict)
+        
+        # Save best model based on mAP@50
+        if map_50 > best_map:
+            best_map = map_50
+            best_checkpoint_path = output_dir / 'best_model.pth'
+            torch.save({
+                'model': model.state_dict(),
+                'epoch': epoch,
+                'map_50': map_50,
+                'map_avg': map_avg,
+            }, best_checkpoint_path)
+            print(f"[INFO] ✓ Best model saved! mAP@50: {best_map:.4f}")
+        
+        # Save log
+        log_stats = {
+            **{f'train_{k}': v for k, v in train_stats.items()},
+            **{f'test_{k}': v for k, v in test_stats.items()},
+            'epoch': epoch,
+            'n_parameters': n_parameters
+        }
+        with (output_dir / "log.txt").open("a") as f:
+            f.write(json.dumps(log_stats) + "\n")
+    
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('\n' + "="*80)
+    print(f'Training completed in {total_time_str}')
+    print(f'Best mAP@50: {best_map:.4f}')
+    print("="*80)
+    
+    wandb.finish()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        'Deformable DETR training for mitosis detection',
+        parents=[get_args_parser()]
+    )
+    args = parser.parse_args()
+    main(args)
