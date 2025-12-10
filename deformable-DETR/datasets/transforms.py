@@ -218,6 +218,48 @@ class RandomVerticalFlip(object):
         return img, target
 
 
+class RandomRotation90(object):
+    """Random 90-degree rotations for pathology images.
+    
+    Rotates by 0, 90, 180, or 270 degrees with equal probability.
+    Critical for pathology where orientation is arbitrary.
+    """
+    def __init__(self, p=0.75):
+        self.p = p
+    
+    def __call__(self, img, target):
+        if random.random() > self.p:
+            return img, target
+        
+        # Choose rotation: 0=90°, 1=180°, 2=270°
+        k = random.randint(1, 3)
+        
+        # Rotate image
+        rotated_image = img.rotate(-90 * k, expand=False)
+        w, h = img.size
+        
+        target = target.copy()
+        if "boxes" in target and len(target["boxes"]) > 0:
+            boxes = target["boxes"]
+            # boxes: [x1, y1, x2, y2]
+            for _ in range(k):
+                # Rotate 90° clockwise: (x, y) -> (h - y, x)
+                x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+                new_x1 = h - y2
+                new_y1 = x1
+                new_x2 = h - y1
+                new_y2 = x2
+                boxes = torch.stack([new_x1, new_y1, new_x2, new_y2], dim=1)
+                # After rotation, dimensions swap
+                w, h = h, w
+            target["boxes"] = boxes
+        
+        if "masks" in target:
+            target['masks'] = torch.rot90(target['masks'], k, [-2, -1])
+        
+        return rotated_image, target
+
+
 class RandomResize(object):
     def __init__(self, sizes, max_size=None):
         assert isinstance(sizes, (list, tuple))

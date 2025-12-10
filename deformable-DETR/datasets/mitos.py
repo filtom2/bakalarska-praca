@@ -46,6 +46,7 @@ def make_mitos_transforms(image_set):
         return T.Compose([
             T.RandomHorizontalFlip(),
             T.RandomVerticalFlip(),
+            T.RandomRotation90(),
             T.RandomResize([256], max_size=512),
             normalize,
         ])

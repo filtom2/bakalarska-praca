@@ -1,10 +1,12 @@
 """
 Azure ML Training Script for Deformable-DETR Mitosis Detection
 Optimized for single V100 GPU with 134,000 images
+Includes mitosis-specific optimizations for 256x256 patches with 1-2 objects
 """
 import argparse
 import datetime
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -12,7 +14,7 @@ import os
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import datasets
 import util.misc as utils
 import datasets.samplers as samplers
@@ -33,40 +35,45 @@ def get_args_parser():
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Path to save outputs (checkpoints, logs)')
     
-    # Training hyperparameters - optimized for V100 with 134k images
+    # Training hyperparameters - optimized for mitosis detection
     parser.add_argument('--batch_size', default=8, type=int,
                         help='Batch size per GPU (V100 can handle 8-16)')
-    parser.add_argument('--epochs', default=50, type=int)
-    parser.add_argument('--lr', default=2e-4, type=float,
-                        help='Learning rate')
-    parser.add_argument('--lr_backbone', default=2e-5, type=float,
+    parser.add_argument('--epochs', default=100, type=int,
+                        help='More epochs for medical imaging')
+    parser.add_argument('--lr', default=1e-4, type=float,
+                        help='Conservative LR for medical images')
+    parser.add_argument('--lr_backbone', default=1e-5, type=float,
                         help='Backbone learning rate (10x lower)')
-    parser.add_argument('--lr_drop', default=40, type=int,
-                        help='LR drop epoch')
+    parser.add_argument('--lr_drop', default=80, type=int,
+                        help='LR drop epoch (later for longer training)')
+    parser.add_argument('--warmup_epochs', default=5, type=int,
+                        help='Number of warmup epochs')
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='Gradient clipping max norm')
     parser.add_argument('--num_workers', default=8, type=int)
+    parser.add_argument('--use_balanced_sampling', action='store_true',
+                        help='Use balanced sampling (2x weight for positive patches)')
     
-    # Model architecture - optimized for speed on V100
+    # Model architecture - optimized for 256x256 patches with 1-2 objects
     parser.add_argument('--backbone', default='resnet50', type=str,
                         help='Backbone architecture')
-    parser.add_argument('--num_queries', default=100, type=int,
-                        help='Number of query slots (reduced from 300 for speed)')
-    parser.add_argument('--num_feature_levels', default=4, type=int,
-                        help='Number of feature levels')
+    parser.add_argument('--num_queries', default=5, type=int,
+                        help='Number of query slots (3-5 optimal for 1-2 objects)')
+    parser.add_argument('--num_feature_levels', default=3, type=int,
+                        help='Feature levels (3 sufficient for 256x256 patches)')
     
-    # Transformer - balanced for speed and performance
+    # Transformer - smaller model for simpler task
     parser.add_argument('--enc_layers', default=3, type=int,
-                        help='Number of encoding layers (reduced from 6 for speed)')
+                        help='Number of encoding layers')
     parser.add_argument('--dec_layers', default=3, type=int,
-                        help='Number of decoding layers (reduced from 6 for speed)')
-    parser.add_argument('--dim_feedforward', default=1024, type=int,
-                        help='FFN dimension')
-    parser.add_argument('--hidden_dim', default=256, type=int,
-                        help='Transformer dimension')
+                        help='Number of decoding layers')
+    parser.add_argument('--dim_feedforward', default=512, type=int,
+                        help='FFN dimension (smaller for 256x256 patches)')
+    parser.add_argument('--hidden_dim', default=128, type=int,
+                        help='Transformer dimension (smaller model)')
     parser.add_argument('--dropout', default=0.1, type=float)
-    parser.add_argument('--nheads', default=8, type=int,
+    parser.add_argument('--nheads', default=4, type=int,
                         help='Number of attention heads')
     parser.add_argument('--dec_n_points', default=4, type=int)
     parser.add_argument('--enc_n_points', default=4, type=int)
@@ -82,15 +89,19 @@ def get_args_parser():
     parser.add_argument('--aux_loss', action='store_true', default=True,
                         help='Auxiliary decoding losses')
     
-    # Matcher
-    parser.add_argument('--set_cost_class', default=2, type=float)
+    # Matcher - rebalanced for mitosis (localization more important)
+    parser.add_argument('--set_cost_class', default=1, type=float,
+                        help='Reduced - classification easy with few objects')
     parser.add_argument('--set_cost_bbox', default=5, type=float)
-    parser.add_argument('--set_cost_giou', default=2, type=float)
+    parser.add_argument('--set_cost_giou', default=3, type=float,
+                        help='Increased for precise localization')
     
-    # Loss coefficients
-    parser.add_argument('--cls_loss_coef', default=2, type=float)
+    # Loss coefficients - rebalanced for mitosis detection
+    parser.add_argument('--cls_loss_coef', default=1, type=float,
+                        help='Reduced - classification easy with 1-2 objects')
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--giou_loss_coef', default=3, type=float,
+                        help='Increased for precise localization')
     parser.add_argument('--focal_alpha', default=0.25, type=float)
     
     # Dataset
@@ -109,6 +120,38 @@ def get_args_parser():
     parser.add_argument('--cache_mode', default=False, action='store_true')
     
     return parser
+
+
+def create_balanced_sampler(dataset):
+    """
+    Create weighted sampler that upweights patches containing mitoses.
+    Patches with objects get 2x weight vs empty patches.
+    """
+    print("[INFO] Creating balanced sampler...")
+    weights = []
+    for idx in range(len(dataset)):
+        ann_ids = dataset.coco.getAnnIds(imgIds=dataset.ids[idx])
+        # 2x weight for patches with mitoses
+        weights.append(2.0 if len(ann_ids) > 0 else 1.0)
+    
+    positive_count = sum(1 for w in weights if w > 1.0)
+    print(f"[INFO] Balanced sampler: {positive_count} positive, {len(weights)-positive_count} negative patches")
+    return WeightedRandomSampler(weights, len(weights))
+
+
+def get_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
+    """
+    Warmup + cosine annealing scheduler.
+    - First warmup_epochs: linear warmup from 0 to base LR
+    - Remaining epochs: cosine decay to near 0
+    """
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+    
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def main(args):
@@ -154,8 +197,11 @@ def main(args):
     dataset_val = build_dataset(image_set='val', args=args)
     print(f"[INFO] Train size: {len(dataset_train)}, Val size: {len(dataset_val)}")
     
-    # Data loaders
-    sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    # Data loaders with optional balanced sampling
+    if args.use_balanced_sampling:
+        sampler_train = create_balanced_sampler(dataset_train)
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     
     batch_sampler_train = torch.utils.data.BatchSampler(
@@ -208,7 +254,10 @@ def main(args):
     ]
     
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+    
+    # Warmup + Cosine scheduler for stable training
+    lr_scheduler = get_warmup_cosine_scheduler(optimizer, args.warmup_epochs, args.epochs)
+    print(f"[INFO] Using warmup ({args.warmup_epochs} epochs) + cosine annealing scheduler")
     
     # Prepare output directory
     output_dir = Path(args.output_dir)
@@ -258,23 +307,29 @@ def main(args):
         print(f"\n[Epoch {epoch+1}] Train Loss: {train_stats['loss']:.4f}")
         print(f"[Epoch {epoch+1}] Val mAP@50: {map_50:.4f}, mAP@75: {map_75:.4f}, mAP: {map_avg:.4f}")
         
-        # Log to WandB
+        # Log to WandB - clean metrics only
         log_dict = {
             "epoch": epoch + 1,
+            # Training
             "train/loss": train_stats['loss'],
             "train/lr": optimizer.param_groups[0]["lr"],
+            "train/loss_ce": train_stats.get('loss_ce', 0),
+            "train/loss_bbox": train_stats.get('loss_bbox', 0),
+            "train/loss_giou": train_stats.get('loss_giou', 0),
+            # Validation - mAP metrics
             "val/mAP": map_avg,
             "val/mAP_50": map_50,
             "val/mAP_75": map_75,
+            # Validation - precision/recall/F-scores
+            "val/precision": test_stats.get('precision', 0),
+            "val/recall": test_stats.get('recall', 0),
+            "val/f1_score": test_stats.get('f1_score', 0),
+            "val/f2_score": test_stats.get('f2_score', 0),
+            # Confusion matrix components
+            "val/TP": test_stats.get('tp', 0),
+            "val/FP": test_stats.get('fp', 0),
+            "val/FN": test_stats.get('fn', 0),
         }
-        # Add all train stats
-        for k, v in train_stats.items():
-            if k != 'loss':
-                log_dict[f"train/{k}"] = v
-        # Add all test stats
-        for k, v in test_stats.items():
-            if k != 'coco_eval_bbox' and isinstance(v, (int, float)):
-                log_dict[f"val/{k}"] = v
         
         wandb.log(log_dict)
         
