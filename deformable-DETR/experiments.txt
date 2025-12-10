@@ -1,0 +1,4 @@
+preprocessing:
+	variable patches from slides -> def. 100
+
+architecture:

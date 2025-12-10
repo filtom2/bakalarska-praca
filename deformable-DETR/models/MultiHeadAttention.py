@@ -196,21 +196,50 @@ class DeformableHeadAttention(nn.Module):
     def init_parameters(self):
         torch.nn.init.constant_(self.delta_proj.weight, 0.0)
         torch.nn.init.constant_(self.Attention_projection.weight, 0.0)
-
         torch.nn.init.constant_(self.Attention_projection.bias, 1 / (self.L * self.K))
 
         def init_xy(bias, x, y):
             torch.nn.init.constant_(bias[:, 0], float(x))
             torch.nn.init.constant_(bias[:, 1], float(y))
 
-        # caution: offset layout will be  M, L, K, 2
+        # Reshape bias for easier indexing: M, L, K, 2
         bias = self.delta_proj.bias.view(self.M, self.L, self.K, 2)
-
-        init_xy(bias[0], x=-self.K, y=-self.K)
-        init_xy(bias[1], x=-self.K, y=0)
-        init_xy(bias[2], x=-self.K, y=self.K)
-        init_xy(bias[3], x=0, y=-self.K)
-        init_xy(bias[4], x=0, y=self.K)
-        init_xy(bias[5], x=self.K, y=-self.K)
-        init_xy(bias[6], x=self.K, y=0)
-        init_xy(bias[7], x=self.K, y=self.K)
+        
+        # Use adaptive spatial offset based on K and feature map size
+        spatial_offset = float(self.K)
+        
+        if self.M == 8:
+            # Full 8-directional coverage (original DETR pattern)
+            init_xy(bias[0], x=-spatial_offset, y=-spatial_offset)  # Top-left
+            init_xy(bias[1], x=-spatial_offset, y=0)                # Left
+            init_xy(bias[2], x=-spatial_offset, y=spatial_offset)   # Bottom-left
+            init_xy(bias[3], x=0, y=-spatial_offset)                # Top
+            init_xy(bias[4], x=0, y=spatial_offset)                 # Bottom
+            init_xy(bias[5], x=spatial_offset, y=-spatial_offset)   # Top-right
+            init_xy(bias[6], x=spatial_offset, y=0)                 # Right
+            init_xy(bias[7], x=spatial_offset, y=spatial_offset)    # Bottom-right
+            
+        elif self.M == 4:
+            # Cardinal directions - better for roughly circular mitoses
+            init_xy(bias[0], x=-spatial_offset, y=0)    # Left
+            init_xy(bias[1], x=0, y=-spatial_offset)    # Top
+            init_xy(bias[2], x=spatial_offset, y=0)     # Right
+            init_xy(bias[3], x=0, y=spatial_offset)     # Bottom
+            
+        elif self.M == 2:
+            # Horizontal spread
+            init_xy(bias[0], x=-spatial_offset, y=0)
+            init_xy(bias[1], x=spatial_offset, y=0)
+            
+        elif self.M == 1:
+            # Single head: centered
+            init_xy(bias[0], x=0, y=0)
+            
+        else:
+            # Generic: circular distribution for arbitrary M
+            import math
+            for m in range(self.M):
+                angle = 2 * math.pi * m / self.M
+                x = spatial_offset * math.cos(angle)
+                y = spatial_offset * math.sin(angle)
+                init_xy(bias[m], x=x, y=y)

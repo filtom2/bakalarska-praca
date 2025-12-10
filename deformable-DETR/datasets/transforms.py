@@ -311,6 +311,29 @@ class RandomErasing(object):
         return self.eraser(img), target
 
 
+class RandomColorJitter(object):
+    """Random color jitter for pathology images.
+    
+    Simulates staining variations across different tissue preparations.
+    """
+    def __init__(self, brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05, p=0.5):
+        self.p = p
+        self.color_jitter = T.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+            hue=hue
+        )
+    
+    def __call__(self, img, target):
+        if random.random() < self.p:
+            # ColorJitter expects PIL Image or Tensor, but we need to handle
+            # the fact that at this point img is still PIL
+            if hasattr(img, 'mode'):  # PIL Image
+                img = self.color_jitter(img)
+        return img, target
+
+
 class Normalize(object):
     def __init__(self, mean, std):
         self.mean = mean

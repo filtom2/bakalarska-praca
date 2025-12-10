@@ -14,12 +14,12 @@ import os
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 import datasets
 import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import train_one_epoch, evaluate
+from engine import train_one_epoch, evaluate, visualize_predictions_wandb, create_confusion_matrix_wandb
 from models import build_model
 
 import wandb
@@ -44,16 +44,12 @@ def get_args_parser():
                         help='Conservative LR for medical images')
     parser.add_argument('--lr_backbone', default=1e-5, type=float,
                         help='Backbone learning rate (10x lower)')
-    parser.add_argument('--lr_drop', default=80, type=int,
-                        help='LR drop epoch (later for longer training)')
     parser.add_argument('--warmup_epochs', default=5, type=int,
                         help='Number of warmup epochs')
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='Gradient clipping max norm')
     parser.add_argument('--num_workers', default=8, type=int)
-    parser.add_argument('--use_balanced_sampling', action='store_true',
-                        help='Use balanced sampling (2x weight for positive patches)')
     
     # Model architecture - optimized for 256x256 patches with 1-2 objects
     parser.add_argument('--backbone', default='resnet50', type=str,
@@ -68,12 +64,12 @@ def get_args_parser():
                         help='Number of encoding layers')
     parser.add_argument('--dec_layers', default=3, type=int,
                         help='Number of decoding layers')
-    parser.add_argument('--dim_feedforward', default=512, type=int,
-                        help='FFN dimension (smaller for 256x256 patches)')
-    parser.add_argument('--hidden_dim', default=128, type=int,
-                        help='Transformer dimension (smaller model)')
+    parser.add_argument('--dim_feedforward', default=1024, type=int,
+                        help='FFN dimension')
+    parser.add_argument('--hidden_dim', default=256, type=int,
+                        help='Transformer dimension')
     parser.add_argument('--dropout', default=0.1, type=float)
-    parser.add_argument('--nheads', default=4, type=int,
+    parser.add_argument('--nheads', default=8, type=int,
                         help='Number of attention heads')
     parser.add_argument('--dec_n_points', default=4, type=int)
     parser.add_argument('--enc_n_points', default=4, type=int)
@@ -86,23 +82,18 @@ def get_args_parser():
     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float)
     
     # Loss
-    parser.add_argument('--aux_loss', action='store_true', default=True,
-                        help='Auxiliary decoding losses')
+    parser.add_argument('--aux_loss', action='store_true', default=True)
     
     # Matcher - rebalanced for mitosis (localization more important)
-    parser.add_argument('--set_cost_class', default=1, type=float,
-                        help='Reduced - classification easy with few objects')
+    parser.add_argument('--set_cost_class', default=1, type=float)
     parser.add_argument('--set_cost_bbox', default=5, type=float)
-    parser.add_argument('--set_cost_giou', default=3, type=float,
-                        help='Increased for precise localization')
+    parser.add_argument('--set_cost_giou', default=3, type=float)
     
     # Loss coefficients - rebalanced for mitosis detection
-    parser.add_argument('--cls_loss_coef', default=1, type=float,
-                        help='Reduced - classification easy with 1-2 objects')
+    parser.add_argument('--cls_loss_coef', default=1, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=3, type=float,
-                        help='Increased for precise localization')
-    parser.add_argument('--focal_alpha', default=0.25, type=float)
+    parser.add_argument('--giou_loss_coef', default=3, type=float)
+    parser.add_argument('--focal_alpha', default=0.5, type=float)
     
     # Dataset
     parser.add_argument('--dataset_file', default='mitos', type=str)
@@ -121,22 +112,6 @@ def get_args_parser():
     
     return parser
 
-
-def create_balanced_sampler(dataset):
-    """
-    Create weighted sampler that upweights patches containing mitoses.
-    Patches with objects get 2x weight vs empty patches.
-    """
-    print("[INFO] Creating balanced sampler...")
-    weights = []
-    for idx in range(len(dataset)):
-        ann_ids = dataset.coco.getAnnIds(imgIds=dataset.ids[idx])
-        # 2x weight for patches with mitoses
-        weights.append(2.0 if len(ann_ids) > 0 else 1.0)
-    
-    positive_count = sum(1 for w in weights if w > 1.0)
-    print(f"[INFO] Balanced sampler: {positive_count} positive, {len(weights)-positive_count} negative patches")
-    return WeightedRandomSampler(weights, len(weights))
 
 
 def get_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
@@ -197,11 +172,8 @@ def main(args):
     dataset_val = build_dataset(image_set='val', args=args)
     print(f"[INFO] Train size: {len(dataset_train)}, Val size: {len(dataset_val)}")
     
-    # Data loaders with optional balanced sampling
-    if args.use_balanced_sampling:
-        sampler_train = create_balanced_sampler(dataset_train)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    # Data loaders - focal loss handles class imbalance
+    sampler_train = torch.utils.data.RandomSampler(dataset_train)
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     
     batch_sampler_train = torch.utils.data.BatchSampler(
@@ -295,8 +267,8 @@ def main(args):
         }, checkpoint_path)
         
         # Evaluate
-        test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, str(output_dir)
+        test_stats, coco_evaluator, vis_samples = evaluate(
+            model, criterion, postprocessors, data_loader_val, base_ds, device, str(output_dir), epoch=epoch
         )
         
         # Extract metrics
@@ -307,7 +279,7 @@ def main(args):
         print(f"\n[Epoch {epoch+1}] Train Loss: {train_stats['loss']:.4f}")
         print(f"[Epoch {epoch+1}] Val mAP@50: {map_50:.4f}, mAP@75: {map_75:.4f}, mAP: {map_avg:.4f}")
         
-        # Log to WandB - clean metrics only
+        # Log to WandB
         log_dict = {
             "epoch": epoch + 1,
             # Training
@@ -330,6 +302,26 @@ def main(args):
             "val/FP": test_stats.get('fp', 0),
             "val/FN": test_stats.get('fn', 0),
         }
+        
+        # Log prediction visualizations to WandB
+        if vis_samples and epoch % 5 == 0:  # Every 5 epochs
+            wandb_images = []
+            for i, (img, pred_boxes, pred_scores, gt_boxes) in enumerate(vis_samples[:8]):
+                wandb_img = visualize_predictions_wandb(img, pred_boxes, pred_scores, gt_boxes, epoch+1, i)
+                if wandb_img is not None:
+                    wandb_images.append(wandb_img)
+            if wandb_images:
+                log_dict["val/predictions"] = wandb_images
+        
+        # Log confusion matrix to WandB
+        confusion_matrix_img = create_confusion_matrix_wandb(
+            test_stats.get('tp', 0),
+            test_stats.get('fp', 0),
+            test_stats.get('fn', 0),
+            epoch + 1
+        )
+        if confusion_matrix_img is not None:
+            log_dict["val/confusion_matrix"] = confusion_matrix_img
         
         wandb.log(log_dict)
         

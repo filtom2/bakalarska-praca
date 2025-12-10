@@ -12,38 +12,40 @@ import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.data_prefetcher import data_prefetcher
 
+import wandb
+import numpy as np
 
-def visualize_predictions(image, pred_boxes, pred_scores, gt_boxes, epoch, batch_idx, save_path):
+
+def visualize_predictions_wandb(image, pred_boxes, pred_scores, gt_boxes, epoch, batch_idx, max_images=16):
     """
-    Visualize predictions vs ground truth for debugging.
-    Saves comparison images to output directory.
+    Visualize predictions vs ground truth and return WandB Image object.
     
     Args:
         image: Tensor [C, H, W] or numpy array
         pred_boxes: Tensor [N, 4] in xyxy format
         pred_scores: Tensor [N,] confidence scores
-        gt_boxes: Tensor [M, 4] in xyxy format (cxcywh normalized -> convert)
+        gt_boxes: Tensor [M, 4] in cxcywh normalized format
         epoch: Current epoch number
         batch_idx: Batch index
-        save_path: Directory to save visualizations
+        max_images: Maximum number of images to log per epoch
+        
+    Returns:
+        wandb.Image object or None if failed
     """
     try:
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
-        from pathlib import Path
-        
-        # Create viz directory
-        viz_dir = Path(save_path) / "visualizations"
-        viz_dir.mkdir(exist_ok=True)
+        from io import BytesIO
+        from PIL import Image
         
         # Convert image tensor to numpy
         if isinstance(image, torch.Tensor):
             img_np = image.cpu().permute(1, 2, 0).numpy()
             # Denormalize
-            mean = [0.485, 0.456, 0.406]
-            std = [0.229, 0.224, 0.225]
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
             img_np = img_np * std + mean
-            img_np = img_np.clip(0, 1)
+            img_np = np.clip(img_np, 0, 1)
         else:
             img_np = image
         
@@ -63,31 +65,123 @@ def visualize_predictions(image, pred_boxes, pred_scores, gt_boxes, epoch, batch
                 box_w = bw * w
                 box_h = bh * h
                 rect = patches.Rectangle((x1, y1), box_w, box_h,
-                                         linewidth=2, edgecolor='g', facecolor='none',
+                                         linewidth=3, edgecolor='lime', facecolor='none',
                                          label='GT')
                 ax.add_patch(rect)
         
         # Predictions in red (with score > 0.3)
         if pred_boxes is not None and len(pred_boxes) > 0:
             pred_boxes_np = pred_boxes.cpu().numpy()
-            pred_scores_np = pred_scores.cpu().numpy() if pred_scores is not None else [1.0] * len(pred_boxes)
+            pred_scores_np = pred_scores.cpu().numpy() if pred_scores is not None else np.ones(len(pred_boxes))
             for box, score in zip(pred_boxes_np, pred_scores_np):
                 if score > 0.3:  # Only show confident predictions
                     x1, y1, x2, y2 = box
                     rect = patches.Rectangle((x1, y1), x2-x1, y2-y1,
-                                             linewidth=2, edgecolor='r', facecolor='none')
+                                             linewidth=2, edgecolor='red', facecolor='none')
                     ax.add_patch(rect)
-                    ax.text(x1, y1-5, f'{score:.2f}', color='red', fontsize=8)
+                    ax.text(x1, y1-5, f'{score:.2f}', color='red', fontsize=10, fontweight='bold')
         
-        ax.set_title(f'Epoch {epoch} - Batch {batch_idx}')
+        ax.set_title(f'Epoch {epoch} - Batch {batch_idx} (Green=GT, Red=Pred)', fontsize=12)
         ax.axis('off')
         
         plt.tight_layout()
-        plt.savefig(viz_dir / f'epoch{epoch:03d}_batch{batch_idx:04d}.png', dpi=100, bbox_inches='tight')
+        
+        # Convert to WandB Image
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        pil_image = Image.open(buf)
+        wandb_image = wandb.Image(pil_image, caption=f"Epoch {epoch} - Batch {batch_idx}")
         plt.close()
         
+        return wandb_image
+        
     except Exception as e:
-        print(f"[WARN] Visualization failed: {e}")
+        print(f"[WARN] WandB visualization failed: {e}")
+        return None
+
+
+def create_confusion_matrix_wandb(tp, fp, fn, epoch):
+    """
+    Create a confusion matrix visualization for WandB.
+    
+    For object detection, we have:
+    - TP: Correctly detected objects
+    - FP: False detections (predicted but no GT)
+    - FN: Missed objects (GT but no prediction)
+    - TN: Not applicable for object detection (would be infinite background patches)
+    
+    Args:
+        tp: True positives count
+        fp: False positives count
+        fn: False negatives count
+        epoch: Current epoch number
+        
+    Returns:
+        wandb.Table with confusion matrix data
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from io import BytesIO
+        from PIL import Image
+        
+        # Create confusion matrix style visualization
+        # For detection: rows = Actual, cols = Predicted
+        # [TP, FN]
+        # [FP, --]
+        
+        fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+        
+        # Create matrix data
+        matrix = np.array([[tp, fn], [fp, 0]])
+        
+        # Create heatmap
+        im = ax.imshow(matrix, cmap='Blues', aspect='auto')
+        
+        # Labels
+        ax.set_xticks([0, 1])
+        ax.set_yticks([0, 1])
+        ax.set_xticklabels(['Detected', 'Not Detected'], fontsize=12)
+        ax.set_yticklabels(['Has Object', 'No Object'], fontsize=12)
+        ax.set_xlabel('Predicted', fontsize=14)
+        ax.set_ylabel('Actual', fontsize=14)
+        
+        # Add text annotations
+        labels = [['TP', 'FN'], ['FP', 'N/A']]
+        for i in range(2):
+            for j in range(2):
+                if i == 1 and j == 1:
+                    text = 'N/A'
+                    color = 'gray'
+                else:
+                    text = f'{labels[i][j]}\n{matrix[i, j]:,}'
+                    color = 'white' if matrix[i, j] > matrix.max()/2 else 'black'
+                ax.text(j, i, text, ha='center', va='center', fontsize=14, color=color, fontweight='bold')
+        
+        # Add colorbar
+        plt.colorbar(im, ax=ax)
+        
+        # Title with metrics
+        precision = tp / (tp + fp + 1e-6)
+        recall = tp / (tp + fn + 1e-6)
+        f1 = 2 * precision * recall / (precision + recall + 1e-6)
+        ax.set_title(f'Detection Matrix (Epoch {epoch})\nP={precision:.3f}, R={recall:.3f}, F1={f1:.3f}', fontsize=14)
+        
+        plt.tight_layout()
+        
+        # Convert to WandB Image
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        pil_image = Image.open(buf)
+        wandb_image = wandb.Image(pil_image, caption=f"Confusion Matrix - Epoch {epoch}")
+        plt.close()
+        
+        return wandb_image
+        
+    except Exception as e:
+        print(f"[WARN] Confusion matrix visualization failed: {e}")
+        return None
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -151,7 +245,26 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, epoch=0, max_vis_samples=8):
+    """
+    Evaluate the model and collect metrics.
+    
+    Args:
+        model: The model to evaluate
+        criterion: Loss criterion
+        postprocessors: Post-processing modules
+        data_loader: Validation data loader
+        base_ds: Base COCO dataset for evaluation
+        device: Device to run on
+        output_dir: Output directory
+        epoch: Current epoch number for logging
+        max_vis_samples: Maximum visualization samples to collect
+        
+    Returns:
+        stats: Dictionary of metrics
+        coco_evaluator: COCO evaluator object
+        visualization_samples: List of (image, pred_boxes, pred_scores, gt_boxes) tuples
+    """
     model.eval()
     criterion.eval()
 
@@ -168,6 +281,10 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     all_fn = 0  # (missed detections)
     iou_threshold = 0.5
     score_threshold = 0.3
+    
+    # Collect visualization samples
+    visualization_samples = []
+    batch_idx = 0
 
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
@@ -190,6 +307,28 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
+        
+        # Collect visualization samples (first few batches with objects)
+        if len(visualization_samples) < max_vis_samples:
+            # Get the raw images from samples (NestedTensor)
+            if hasattr(samples, 'tensors'):
+                batch_images = samples.tensors
+            else:
+                batch_images = samples
+            
+            for i, (target, result) in enumerate(zip(targets, results)):
+                if len(visualization_samples) >= max_vis_samples:
+                    break
+                # Prefer images with ground truth objects
+                if len(target['boxes']) > 0 or len(result['boxes']) > 0:
+                    visualization_samples.append((
+                        batch_images[i].detach().cpu(),  # Image tensor
+                        result['boxes'].detach().cpu(),   # Predicted boxes (xyxy)
+                        result['scores'].detach().cpu(),  # Prediction scores
+                        target['boxes'].detach().cpu()    # GT boxes (cxcywh normalized)
+                    ))
+        
+        batch_idx += 1
         
         # Compute TP, FP, FN for precision/recall
         for target, result in zip(targets, results):
@@ -286,4 +425,4 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     if coco_evaluator is not None:
         if 'bbox' in postprocessors.keys():
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
-    return stats, coco_evaluator
+    return stats, coco_evaluator, visualization_samples
