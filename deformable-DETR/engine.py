@@ -192,7 +192,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    metric_logger.add_meter('grad_norm', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 50
 
@@ -233,9 +232,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(loss_ce=loss_dict_reduced_scaled.get('loss_ce', 0))
         metric_logger.update(loss_bbox=loss_dict_reduced_scaled.get('loss_bbox', 0))
         metric_logger.update(loss_giou=loss_dict_reduced_scaled.get('loss_giou', 0))
-        metric_logger.update(class_error=loss_dict_reduced['class_error'])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        metric_logger.update(grad_norm=grad_total_norm)
 
         samples, targets = prefetcher.next()
     # gather the stats from all processes
@@ -280,7 +277,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     all_fp = 0
     all_fn = 0  # (missed detections)
     iou_threshold = 0.5
-    score_threshold = 0.3
+    score_threshold = 0.35
     
     # Collect visualization samples
     visualization_samples = []
@@ -401,10 +398,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     if coco_evaluator is not None:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
-    
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     
-    # Compute precision, recall, F1, F2
+    # Compute precision, recall, F1, F2 from TP/FP/FN
     precision = all_tp / (all_tp + all_fp + 1e-6)
     recall = all_tp / (all_tp + all_fn + 1e-6)
     f1_score = 2 * precision * recall / (precision + recall + 1e-6)

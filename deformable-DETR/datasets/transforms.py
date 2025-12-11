@@ -218,46 +218,62 @@ class RandomVerticalFlip(object):
         return img, target
 
 
+def rotate90(image, target, k):
+    """Rotate image and boxes by k*90 degrees counter-clockwise."""
+    # Rotate image
+    rotated_image = image.rotate(k * 90, expand=False)
+    
+    w, h = image.size
+    
+    target = target.copy()
+    if "boxes" in target:
+        boxes = target["boxes"]  # [x1, y1, x2, y2]
+        
+        if k == 1:  # 90 degrees CCW
+            # (x, y) -> (y, w - x)
+            new_boxes = torch.stack([
+                boxes[:, 1],           # new x1 = old y1
+                w - boxes[:, 2],       # new y1 = w - old x2
+                boxes[:, 3],           # new x2 = old y2
+                w - boxes[:, 0]        # new y2 = w - old x1
+            ], dim=1)
+        elif k == 2:  # 180 degrees
+            # (x, y) -> (w - x, h - y)
+            new_boxes = torch.stack([
+                w - boxes[:, 2],       # new x1 = w - old x2
+                h - boxes[:, 3],       # new y1 = h - old y2
+                w - boxes[:, 0],       # new x2 = w - old x1
+                h - boxes[:, 1]        # new y2 = h - old y1
+            ], dim=1)
+        elif k == 3:  # 270 degrees CCW (90 CW)
+            # (x, y) -> (h - y, x)
+            new_boxes = torch.stack([
+                h - boxes[:, 3],       # new x1 = h - old y2
+                boxes[:, 0],           # new y1 = old x1
+                h - boxes[:, 1],       # new x2 = h - old y1
+                boxes[:, 2]            # new y2 = old x2
+            ], dim=1)
+        else:
+            new_boxes = boxes
+        
+        target["boxes"] = new_boxes
+    
+    if "masks" in target:
+        target['masks'] = torch.rot90(target['masks'], k, dims=[-2, -1])
+    
+    return rotated_image, target
+
+
 class RandomRotation90(object):
-    """Random 90-degree rotations for pathology images.
-    
-    Rotates by 0, 90, 180, or 270 degrees with equal probability.
-    Critical for pathology where orientation is arbitrary.
-    """
+    """Random 90-degree rotation for pathology images (0, 90, 180, or 270 degrees)."""
     def __init__(self, p=0.75):
-        self.p = p
-    
+        self.p = p  # Probability of any rotation (vs no rotation)
+
     def __call__(self, img, target):
-        if random.random() > self.p:
-            return img, target
-        
-        # Choose rotation: 0=90°, 1=180°, 2=270°
-        k = random.randint(1, 3)
-        
-        # Rotate image
-        rotated_image = img.rotate(-90 * k, expand=False)
-        w, h = img.size
-        
-        target = target.copy()
-        if "boxes" in target and len(target["boxes"]) > 0:
-            boxes = target["boxes"]
-            # boxes: [x1, y1, x2, y2]
-            for _ in range(k):
-                # Rotate 90° clockwise: (x, y) -> (h - y, x)
-                x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
-                new_x1 = h - y2
-                new_y1 = x1
-                new_x2 = h - y1
-                new_y2 = x2
-                boxes = torch.stack([new_x1, new_y1, new_x2, new_y2], dim=1)
-                # After rotation, dimensions swap
-                w, h = h, w
-            target["boxes"] = boxes
-        
-        if "masks" in target:
-            target['masks'] = torch.rot90(target['masks'], k, [-2, -1])
-        
-        return rotated_image, target
+        if random.random() < self.p:
+            k = random.choice([1, 2, 3])  # 90, 180, or 270 degrees
+            return rotate90(img, target, k)
+        return img, target
 
 
 class RandomResize(object):
@@ -332,6 +348,106 @@ class RandomColorJitter(object):
             if hasattr(img, 'mode'):  # PIL Image
                 img = self.color_jitter(img)
         return img, target
+
+
+class RandomStainAugmentation(object):
+    """
+    Stain augmentation for H&E histopathology images.
+    
+    Simulates variations in Hematoxylin (purple/blue) and Eosin (pink) staining
+    that occur due to different lab protocols, tissue preparation, and scanners.
+    
+    Uses Reinhard-style color transfer in LAB color space to perturb stain colors
+    while preserving tissue structure.
+    """
+    def __init__(self, sigma_l=0.05, sigma_a=0.08, sigma_b=0.08, p=0.5):
+        self.sigma_l = sigma_l
+        self.sigma_a = sigma_a
+        self.sigma_b = sigma_b
+        self.p = p
+    
+    def __call__(self, img, target):
+        if random.random() < self.p:
+            if hasattr(img, 'mode') and img.mode == 'RGB':  # PIL Image
+                img = self._augment_stain(img)
+        return img, target
+    
+    def _augment_stain(self, img):
+        """Apply stain augmentation in LAB color space."""
+        import numpy as np
+        from PIL import Image
+        
+        # Convert to numpy
+        img_np = np.array(img).astype(np.float32) / 255.0
+        
+        # RGB to LAB conversion (simplified approximation)
+        # First convert to linear RGB
+        img_linear = np.where(img_np <= 0.04045, 
+                              img_np / 12.92, 
+                              ((img_np + 0.055) / 1.055) ** 2.4)
+        
+        # RGB to XYZ
+        M_rgb_to_xyz = np.array([
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041]
+        ])
+        xyz = np.dot(img_linear.reshape(-1, 3), M_rgb_to_xyz.T).reshape(img_np.shape)
+        
+        # XYZ to LAB
+        # Reference white point (D65)
+        ref_white = np.array([0.95047, 1.0, 1.08883])
+        xyz_normalized = xyz / ref_white
+        
+        epsilon = 0.008856
+        kappa = 903.3
+        
+        f_xyz = np.where(xyz_normalized > epsilon,
+                         xyz_normalized ** (1/3),
+                         (kappa * xyz_normalized + 16) / 116)
+        
+        L = 116 * f_xyz[..., 1] - 16
+        a = 500 * (f_xyz[..., 0] - f_xyz[..., 1])
+        b = 200 * (f_xyz[..., 1] - f_xyz[..., 2])
+        
+        # Add random perturbations (the actual stain augmentation)
+        L_perturbed = L + np.random.normal(0, self.sigma_l * 100, L.shape)
+        a_perturbed = a + np.random.normal(0, self.sigma_a * 128, a.shape)
+        b_perturbed = b + np.random.normal(0, self.sigma_b * 128, b.shape)
+        
+        # Clamp LAB values
+        L_perturbed = np.clip(L_perturbed, 0, 100)
+        a_perturbed = np.clip(a_perturbed, -128, 127)
+        b_perturbed = np.clip(b_perturbed, -128, 127)
+        
+        # LAB to XYZ
+        f_y = (L_perturbed + 16) / 116
+        f_x = a_perturbed / 500 + f_y
+        f_z = f_y - b_perturbed / 200
+        
+        x = np.where(f_x ** 3 > epsilon, f_x ** 3, (116 * f_x - 16) / kappa)
+        y = np.where(L_perturbed > kappa * epsilon, ((L_perturbed + 16) / 116) ** 3, L_perturbed / kappa)
+        z = np.where(f_z ** 3 > epsilon, f_z ** 3, (116 * f_z - 16) / kappa)
+        
+        xyz_new = np.stack([x * ref_white[0], y * ref_white[1], z * ref_white[2]], axis=-1)
+        
+        # XYZ to RGB
+        M_xyz_to_rgb = np.array([
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252]
+        ])
+        rgb_linear = np.dot(xyz_new.reshape(-1, 3), M_xyz_to_rgb.T).reshape(img_np.shape)
+        rgb_linear = np.clip(rgb_linear, 0, 1)
+        
+        # Linear RGB to sRGB
+        rgb = np.where(rgb_linear <= 0.0031308,
+                       12.92 * rgb_linear,
+                       1.055 * (rgb_linear ** (1/2.4)) - 0.055)
+        
+        rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+        
+        return Image.fromarray(rgb)
 
 
 class Normalize(object):

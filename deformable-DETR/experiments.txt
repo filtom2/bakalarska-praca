@@ -2,3 +2,7 @@ preprocessing:
 	variable patches from slides -> def. 100
 
 architecture:
+
+
+	e.g. we had a lot of overlaping ground box predictions so we could implement NMS or soft- NMS as a ptntial fix
+	 										^															 i															  i  												Architecture modifictation for our final work (?)

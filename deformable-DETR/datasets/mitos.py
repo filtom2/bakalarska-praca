@@ -48,6 +48,7 @@ def make_mitos_transforms(image_set):
             T.RandomVerticalFlip(),
             T.RandomRotation90(),
             T.RandomColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.05),
+            T.RandomStainAugmentation(sigma_l=0.05, sigma_a=0.08, sigma_b=0.08, p=0.5),
             T.RandomResize([256], max_size=512),
             normalize,
         ])

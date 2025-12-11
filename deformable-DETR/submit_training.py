@@ -8,10 +8,10 @@ from pathlib import Path
 import json
 
 # Training Configuration
-EPOCHS = 50
+EPOCHS = 150
 BATCH_SIZE = 8
 LEARNING_RATE = 2e-4
-NUM_QUERIES = 5 # Number of experts that predict 
+NUM_QUERIES = 3 # Number of experts that predict (def. 5)
 ENC_LAYERS = 3
 DEC_LAYERS = 3
 

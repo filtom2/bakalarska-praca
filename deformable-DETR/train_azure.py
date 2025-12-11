@@ -1,7 +1,6 @@
 """
 Azure ML Training Script for Deformable-DETR Mitosis Detection
 Optimized for single V100 GPU with 134,000 images
-Includes mitosis-specific optimizations for 256x256 patches with 1-2 objects
 """
 import argparse
 import datetime
@@ -35,48 +34,47 @@ def get_args_parser():
     parser.add_argument('--output_dir', type=str, required=True,
                         help='Path to save outputs (checkpoints, logs)')
     
-    # Training hyperparameters - optimized for mitosis detection
     parser.add_argument('--batch_size', default=8, type=int,
                         help='Batch size per GPU (V100 can handle 8-16)')
     parser.add_argument('--epochs', default=100, type=int,
                         help='More epochs for medical imaging')
-    parser.add_argument('--lr', default=1e-4, type=float,
-                        help='Conservative LR for medical images')
-    parser.add_argument('--lr_backbone', default=1e-5, type=float,
-                        help='Backbone learning rate (10x lower)')
-    parser.add_argument('--warmup_epochs', default=5, type=int,
-                        help='Number of warmup epochs')
+    parser.add_argument('--lr', default=2e-4, type=float,
+                        help='Learning rate')
+    parser.add_argument('--lr_backbone', default=2e-5, type=float,
+                        help='Backbone learning rate')
+    parser.add_argument('--warmup_epochs', default=10, type=int,
+                        help='Number of warmup epochs (def. 5)')
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='Gradient clipping max norm')
     parser.add_argument('--num_workers', default=8, type=int)
     
-    # Model architecture - optimized for 256x256 patches with 1-2 objects
-    parser.add_argument('--backbone', default='resnet50', type=str,
-                        help='Backbone architecture')
+    # Model architecture
+    parser.add_argument('--backbone', default='resnet101', type=str,
+                        help='Backbone (resnet50 or resnet101)')
     parser.add_argument('--num_queries', default=5, type=int,
-                        help='Number of query slots (3-5 optimal for 1-2 objects)')
+                        help='Number of query slots')
     parser.add_argument('--num_feature_levels', default=3, type=int,
-                        help='Feature levels (3 sufficient for 256x256 patches)')
+                        help='Feature levels')
     
-    # Transformer - smaller model for simpler task
+    # Transformer
     parser.add_argument('--enc_layers', default=3, type=int,
                         help='Number of encoding layers')
     parser.add_argument('--dec_layers', default=3, type=int,
                         help='Number of decoding layers')
-    parser.add_argument('--dim_feedforward', default=1024, type=int,
+    parser.add_argument('--dim_feedforward', default=512, type=int,
                         help='FFN dimension')
-    parser.add_argument('--hidden_dim', default=256, type=int,
+    parser.add_argument('--hidden_dim', default=128, type=int,
                         help='Transformer dimension')
     parser.add_argument('--dropout', default=0.1, type=float)
-    parser.add_argument('--nheads', default=8, type=int,
+    parser.add_argument('--nheads', default=4, type=int,
                         help='Number of attention heads')
     parser.add_argument('--dec_n_points', default=4, type=int)
     parser.add_argument('--enc_n_points', default=4, type=int)
     parser.add_argument('--last_height', default=16, type=int)
     parser.add_argument('--last_width', default=16, type=int)
     
-    # Position embedding
+    # Positional embedding
     parser.add_argument('--position_embedding', default='sine', type=str,
                         choices=('sine', 'learned'))
     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float)
@@ -84,16 +82,18 @@ def get_args_parser():
     # Loss
     parser.add_argument('--aux_loss', action='store_true', default=True)
     
-    # Matcher - rebalanced for mitosis (localization more important)
-    parser.add_argument('--set_cost_class', default=1, type=float)
+    # Matcher - rebalanced for mitosis
+    parser.add_argument('--set_cost_class', default=2, type=float)
     parser.add_argument('--set_cost_bbox', default=5, type=float)
-    parser.add_argument('--set_cost_giou', default=3, type=float)
+    parser.add_argument('--set_cost_giou', default=2, type=float)
     
-    # Loss coefficients - rebalanced for mitosis detection
-    parser.add_argument('--cls_loss_coef', default=1, type=float)
+    # Loss coefficients - increased cls_loss to reduce FP
+    parser.add_argument('--cls_loss_coef', default=3, type=float,
+                        help='Increased to penalize false positives')
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=3, type=float)
-    parser.add_argument('--focal_alpha', default=0.5, type=float)
+    parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--focal_alpha', default=0.4, type=float,
+                        help='Penalize easy negatives more')
     
     # Dataset
     parser.add_argument('--dataset_file', default='mitos', type=str)
@@ -113,7 +113,6 @@ def get_args_parser():
     return parser
 
 
-
 def get_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
     """
     Warmup + cosine annealing scheduler.
@@ -127,6 +126,70 @@ def get_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
         return 0.5 * (1 + math.cos(math.pi * progress))
     
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def save_configuration(args, output_dir, n_parameters=None):
+    """Save model configuration and techniques to a readable text file."""
+    config_path = Path(output_dir) / "configuration.txt"
+    
+    with open(config_path, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("DEFORMABLE DETR - MODEL CONFIGURATION\n")
+        f.write("=" * 60 + "\n\n")
+        
+        f.write("### ARCHITECTURE ###\n")
+        f.write(f"Backbone: {args.backbone}\n")
+        f.write(f"Num Queries: {args.num_queries}\n")
+        f.write(f"Encoder Layers: {args.enc_layers}\n")
+        f.write(f"Decoder Layers: {args.dec_layers}\n")
+        f.write(f"Hidden Dim: {args.hidden_dim}\n")
+        f.write(f"FFN Dim: {args.dim_feedforward}\n")
+        f.write(f"Attention Heads: {args.nheads}\n")
+        f.write(f"Feature Levels: {args.num_feature_levels}\n")
+        if n_parameters:
+            f.write(f"Trainable Parameters: {n_parameters:,}\n")
+        f.write("\n")
+        
+        f.write("### TRAINING ###\n")
+        f.write(f"Epochs: {args.epochs}\n")
+        f.write(f"Batch Size: {args.batch_size}\n")
+        f.write(f"Learning Rate: {args.lr}\n")
+        f.write(f"Backbone LR: {args.lr_backbone}\n")
+        f.write(f"Warmup Epochs: {args.warmup_epochs}\n")
+        f.write(f"Weight Decay: {args.weight_decay}\n")
+        f.write(f"Gradient Clip: {args.clip_max_norm}\n")
+        f.write("\n")
+        
+        f.write("### LOSS WEIGHTS ###\n")
+        f.write(f"Classification Loss: {args.cls_loss_coef}\n")
+        f.write(f"BBox Loss: {args.bbox_loss_coef}\n")
+        f.write(f"GIoU Loss: {args.giou_loss_coef}\n")
+        f.write(f"Focal Alpha: {args.focal_alpha}\n")
+        f.write(f"Auxiliary Loss: {args.aux_loss}\n")
+        f.write("\n")
+        
+        f.write("### MATCHER ###\n")
+        f.write(f"Set Cost Class: {args.set_cost_class}\n")
+        f.write(f"Set Cost BBox: {args.set_cost_bbox}\n")
+        f.write(f"Set Cost GIoU: {args.set_cost_giou}\n")
+        f.write("\n")
+        
+        f.write("### AUGMENTATIONS ###\n")
+        f.write("- RandomHorizontalFlip (p=0.5)\n")
+        f.write("- RandomVerticalFlip (p=0.5)\n")
+        f.write("- RandomRotation90 (p=0.75)\n")
+        f.write("- RandomColorJitter (brightness=0.2, contrast=0.2)\n")
+        f.write("- RandomStainAugmentation (LAB space, p=0.5)\n")
+        f.write("\n")
+        
+        f.write("### EVALUATION ###\n")
+        f.write("Score Threshold: 0.35\n")
+        f.write("IoU Threshold: 0.5\n")
+        f.write("\n")
+        
+        f.write("=" * 60 + "\n")
+    
+    print(f"[INFO] Configuration saved to: {config_path}")
 
 
 def main(args):
@@ -166,13 +229,16 @@ def main(args):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'[INFO] Number of trainable parameters: {n_parameters:,}')
     
+    # Save configuration to file
+    save_configuration(args, args.output_dir, n_parameters)
+    
     # Build datasets
     print(f"\n[INFO] Loading datasets from {args.data_path}...")
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
     print(f"[INFO] Train size: {len(dataset_train)}, Val size: {len(dataset_val)}")
     
-    # Data loaders - focal loss handles class imbalance
+    # Data loaders
     sampler_train = torch.utils.data.RandomSampler(dataset_train)
     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     
@@ -279,25 +345,22 @@ def main(args):
         print(f"\n[Epoch {epoch+1}] Train Loss: {train_stats['loss']:.4f}")
         print(f"[Epoch {epoch+1}] Val mAP@50: {map_50:.4f}, mAP@75: {map_75:.4f}, mAP: {map_avg:.4f}")
         
-        # Log to WandB
+        # Log to WandB - only essential metrics
         log_dict = {
-            "epoch": epoch + 1,
-            # Training
+            # Train metrics (5)
             "train/loss": train_stats['loss'],
-            "train/lr": optimizer.param_groups[0]["lr"],
             "train/loss_ce": train_stats.get('loss_ce', 0),
             "train/loss_bbox": train_stats.get('loss_bbox', 0),
             "train/loss_giou": train_stats.get('loss_giou', 0),
-            # Validation - mAP metrics
+            "train/lr": optimizer.param_groups[0]["lr"],
+            # Val metrics (10)
             "val/mAP": map_avg,
             "val/mAP_50": map_50,
             "val/mAP_75": map_75,
-            # Validation - precision/recall/F-scores
             "val/precision": test_stats.get('precision', 0),
             "val/recall": test_stats.get('recall', 0),
             "val/f1_score": test_stats.get('f1_score', 0),
             "val/f2_score": test_stats.get('f2_score', 0),
-            # Confusion matrix components
             "val/TP": test_stats.get('tp', 0),
             "val/FP": test_stats.get('fp', 0),
             "val/FN": test_stats.get('fn', 0),
