@@ -1,5 +1,19 @@
-pycocotools
 torch>=1.5.0
 torchvision>=0.6.0
-tqdm
+
+pycocotools
+numpy
 scipy
+tqdm
+Pillow
+
+matplotlib
+pandas
+seaborn
+wandb
+
+azure-ai-ml
+azure-identity
+
+# WSI Processing (optional for extract_wsi_patches.py)
+# openslide-python

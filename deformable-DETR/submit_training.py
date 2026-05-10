@@ -1,17 +1,15 @@
-"""
-Azure ML Job Submission for Deformable DETR Training on extracted MITOS patches.
-"""
 from azure.ai.ml import command, Input, Output
 from azure.ai.ml import MLClient
 from azure.identity import InteractiveBrowserCredential
 from pathlib import Path
+from datetime import datetime
 import json
 
 # Training Configuration
 EPOCHS = 150
 BATCH_SIZE = 8
 LEARNING_RATE = 2e-4
-NUM_QUERIES = 3 # Number of experts that predict (def. 5)
+NUM_QUERIES = 5 # Number of experts that predict
 ENC_LAYERS = 3
 DEC_LAYERS = 3
 
@@ -26,12 +24,12 @@ config_path = Path(__file__).parent / "config.json"
 with open(config_path, 'r') as f:
     config = json.load(f)
 
-print("[INFO] Connecting to Azure ML...")
+print("Connecting to Azure ML...")
 credential = InteractiveBrowserCredential(tenant_id="5dbf1add-202a-4b8d-815b-bf0fb024e033")
 ml_client = MLClient.from_config(credential=credential, path=config_path)
 
-print(f"[INFO] Workspace: {config['workspace_name']}")
-print(f"[INFO] Resource Group: {config['resource_group']}")
+print(f"Workspace: {config['workspace_name']}")
+print(f"Resource Group: {config['resource_group']}")
 
 # Get code directory
 code_dir = str(Path(__file__).parent.resolve())
@@ -97,4 +95,55 @@ returned_job = ml_client.jobs.create_or_update(job)
 print(f"\n[SUCCESS] Job submitted!")
 print(f"Job Name: {returned_job.name}")
 print(f"Status: {returned_job.status}")
-print(f"\nMonitor: https://ml.azure.com/runs/{returned_job.name}?wsid=/subscriptions/{config['subscription_id']}/resourcegroups/{config['resource_group']}/workspaces/{config['workspace_name']}")
+print(f"\nRun in Azure ML Studio:")
+print(f"{returned_job.studio_url}")
+
+# Save configuration locally for research tracking
+experiments_dir = Path(__file__).parent / "experiments"
+experiments_dir.mkdir(exist_ok=True)
+
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+config_filename = f"{timestamp}_{returned_job.name}.txt"
+config_filepath = experiments_dir / config_filename
+
+with open(config_filepath, 'w') as f:
+    f.write("=" * 60 + "\n")
+    f.write("DEFORMABLE DETR - EXPERIMENT CONFIGURATION\n")
+    f.write("=" * 60 + "\n\n")
+    
+    f.write(f"Job Name: {returned_job.name}\n")
+    f.write(f"Submitted: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Status: {returned_job.status}\n\n")
+    
+    f.write("TRAINING\n")
+    f.write(f"Epochs: {EPOCHS}\n")
+    f.write(f"Batch Size: {BATCH_SIZE}\n")
+    f.write(f"Learning Rate: {LEARNING_RATE}\n")
+    f.write(f"Num Queries: {NUM_QUERIES}\n")
+    f.write(f"Encoder Layers: {ENC_LAYERS}\n")
+    f.write(f"Decoder Layers: {DEC_LAYERS}\n\n")
+    
+    f.write("ARCHITECTURE\n")
+    f.write("Backbone: resnet101\n")
+    f.write("Hidden Dim: 128\n")
+    f.write("FFN Dim: 512\n")
+    f.write("Attention Heads: 4\n")
+    f.write("Warmup Epochs: 10\n\n")
+    
+    f.write("AUGMENTATIONS\n")
+    f.write("- RandomHorizontalFlip (p=0.5)\n")
+    f.write("- RandomVerticalFlip (p=0.5)\n")
+    f.write("- RandomRotation90 (p=0.75)\n")
+    f.write("- RandomColorJitter\n")
+    f.write("- RandomStainAugmentation (LAB space)\n\n")
+    
+    f.write("EVALUATION\n")
+    f.write("Score Threshold: 0.35\n")
+    f.write("IoU Threshold: 0.5\n\n")
+    
+    f.write("AZURE\n")
+    f.write(f"Compute: {COMPUTE_NAME}\n")
+    f.write(f"Environment: {ENVIRONMENT}\n")
+    f.write(f"Dataset: {PATCH_DATASET_URI}\n\n")
+
+print(f"Configuration saved locally: {config_filepath}")

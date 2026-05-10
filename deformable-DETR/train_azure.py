@@ -1,7 +1,3 @@
-"""
-Azure ML Training Script for Deformable-DETR Mitosis Detection
-Optimized for single V100 GPU with 134,000 images
-"""
 import argparse
 import datetime
 import json
@@ -22,7 +18,6 @@ from engine import train_one_epoch, evaluate, visualize_predictions_wandb, creat
 from models import build_model
 
 import wandb
-
 
 
 def get_args_parser():
@@ -74,12 +69,9 @@ def get_args_parser():
     parser.add_argument('--last_height', default=16, type=int)
     parser.add_argument('--last_width', default=16, type=int)
     
-    # Positional embedding
     parser.add_argument('--position_embedding', default='sine', type=str,
                         choices=('sine', 'learned'))
     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float)
-    
-    # Loss
     parser.add_argument('--aux_loss', action='store_true', default=True)
     
     # Matcher - rebalanced for mitosis
@@ -88,21 +80,31 @@ def get_args_parser():
     parser.add_argument('--set_cost_giou', default=2, type=float)
     
     # Loss coefficients - increased cls_loss to reduce FP
-    parser.add_argument('--cls_loss_coef', default=3, type=float,
-                        help='Increased to penalize false positives')
+    parser.add_argument('--cls_loss_coef', default=3, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--focal_alpha', default=0.4, type=float,
-                        help='Penalize easy negatives more')
+    parser.add_argument('--focal_alpha', default=0.4, type=float)
     
-    # Dataset
+        
+    # BiFPN feature fusion
+    parser.add_argument('--num_bifpn_layers', default=0, type=int,
+                        help='Number of BiFPN fusion layers inserted after input_proj (0 = disabled, 2 = recommended)')
+
+    # Ablation Study Arguments
+    parser.add_argument('--no_zoom_in_bounding', action='store_true',
+                        help='Disable tanh and scale factors for bounding')
+    parser.add_argument('--no_zero_bias_init', action='store_true',
+                        help='Disable zero bias initialization in deformable attention')
+    parser.add_argument('--scale_factors', nargs='+', type=float,
+                        help='Scale factors for zoom-in attention (e.g., 2 4 8 16)')
+    parser.add_argument('--no_stain_aug', action='store_true')
+    parser.add_argument('--no_color_aug', action='store_true')
+
     parser.add_argument('--dataset_file', default='mitos', type=str)
     
-    # Device
-    parser.add_argument('--device', default='cuda', help='device to use')
+    parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=42, type=int)
     
-    # Fixed parameters
     parser.add_argument('--lr_backbone_names', default=["backbone.0"], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], 
                         type=str, nargs='+')
@@ -114,11 +116,6 @@ def get_args_parser():
 
 
 def get_warmup_cosine_scheduler(optimizer, warmup_epochs, total_epochs):
-    """
-    Warmup + cosine annealing scheduler.
-    - First warmup_epochs: linear warmup from 0 to base LR
-    - Remaining epochs: cosine decay to near 0
-    """
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return (epoch + 1) / warmup_epochs
@@ -150,7 +147,7 @@ def save_configuration(args, output_dir, n_parameters=None):
             f.write(f"Trainable Parameters: {n_parameters:,}\n")
         f.write("\n")
         
-        f.write("### TRAINING ###\n")
+        f.write("TRAINING\n")
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Learning Rate: {args.lr}\n")
@@ -160,7 +157,7 @@ def save_configuration(args, output_dir, n_parameters=None):
         f.write(f"Gradient Clip: {args.clip_max_norm}\n")
         f.write("\n")
         
-        f.write("### LOSS WEIGHTS ###\n")
+        f.write("LOSS WEIGHTS\n")
         f.write(f"Classification Loss: {args.cls_loss_coef}\n")
         f.write(f"BBox Loss: {args.bbox_loss_coef}\n")
         f.write(f"GIoU Loss: {args.giou_loss_coef}\n")
@@ -168,28 +165,34 @@ def save_configuration(args, output_dir, n_parameters=None):
         f.write(f"Auxiliary Loss: {args.aux_loss}\n")
         f.write("\n")
         
-        f.write("### MATCHER ###\n")
+        f.write("MATCHER\n")
         f.write(f"Set Cost Class: {args.set_cost_class}\n")
         f.write(f"Set Cost BBox: {args.set_cost_bbox}\n")
         f.write(f"Set Cost GIoU: {args.set_cost_giou}\n")
         f.write("\n")
         
-        f.write("### AUGMENTATIONS ###\n")
+        f.write("AUGMENTATIONS\n")
         f.write("- RandomHorizontalFlip (p=0.5)\n")
         f.write("- RandomVerticalFlip (p=0.5)\n")
         f.write("- RandomRotation90 (p=0.75)\n")
-        f.write("- RandomColorJitter (brightness=0.2, contrast=0.2)\n")
-        f.write("- RandomStainAugmentation (LAB space, p=0.5)\n")
+        if not getattr(args, 'no_color_aug', False):
+            f.write("- RandomColorJitter (brightness=0.2, contrast=0.2)\n")
+            if not getattr(args, 'no_stain_aug', False):
+                f.write("- RandomStainAugmentation (LAB space, p=0.5)\n")
         f.write("\n")
         
-        f.write("### EVALUATION ###\n")
+        f.write("ABLATION CONFIGS\n")
+        f.write(f"No Zoom-in Bounding: {getattr(args, 'no_zoom_in_bounding', False)}\n")
+        f.write(f"No Zero-Bias Init: {getattr(args, 'no_zero_bias_init', False)}\n")
+        f.write(f"Custom Scale Factors: {getattr(args, 'scale_factors', None)}\n")
+        f.write("\n")
+        
+        f.write("EVALUATION\n")
         f.write("Score Threshold: 0.35\n")
         f.write("IoU Threshold: 0.5\n")
         f.write("\n")
-        
-        f.write("=" * 60 + "\n")
     
-    print(f"[INFO] Configuration saved to: {config_path}")
+    print(f"Configuration saved to: {config_path}")
 
 
 def main(args):
@@ -200,9 +203,7 @@ def main(args):
         config=vars(args)
         )
     
-    print("="*80)
     print("Deformable-DETR for Mitosis Detection")
-    print("="*80)
     print(f"Data path: {args.data_path}")
     print(f"Output dir: {args.output_dir}")
     print(f"Batch size: {args.batch_size}")
@@ -210,7 +211,6 @@ def main(args):
     print(f"Learning rate: {args.lr}")
     print(f"Num queries: {args.num_queries}")
     print(f"Encoder layers: {args.enc_layers}, Decoder layers: {args.dec_layers}")
-    print("="*80)
     
     device = torch.device(args.device)
     args.pre_norm = False
@@ -222,21 +222,21 @@ def main(args):
     random.seed(seed)
     
     # Build model
-    print("\n[INFO] Building model...")
+    print("Building model...")
     model, criterion, postprocessors = build_model(args)
     model.to(device)
     
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'[INFO] Number of trainable parameters: {n_parameters:,}')
+    print(f'Number of trainable parameters: {n_parameters:,}')
     
     # Save configuration to file
     save_configuration(args, args.output_dir, n_parameters)
     
     # Build datasets
-    print(f"\n[INFO] Loading datasets from {args.data_path}...")
+    print(f"Loading datasets from {args.data_path}...")
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
-    print(f"[INFO] Train size: {len(dataset_train)}, Val size: {len(dataset_val)}")
+    print(f"Train size: {len(dataset_train)}, Val size: {len(dataset_val)}")
     
     # Data loaders
     sampler_train = torch.utils.data.RandomSampler(dataset_train)
@@ -345,15 +345,12 @@ def main(args):
         print(f"\n[Epoch {epoch+1}] Train Loss: {train_stats['loss']:.4f}")
         print(f"[Epoch {epoch+1}] Val mAP@50: {map_50:.4f}, mAP@75: {map_75:.4f}, mAP: {map_avg:.4f}")
         
-        # Log to WandB - only essential metrics
         log_dict = {
-            # Train metrics (5)
             "train/loss": train_stats['loss'],
             "train/loss_ce": train_stats.get('loss_ce', 0),
             "train/loss_bbox": train_stats.get('loss_bbox', 0),
             "train/loss_giou": train_stats.get('loss_giou', 0),
             "train/lr": optimizer.param_groups[0]["lr"],
-            # Val metrics (10)
             "val/mAP": map_avg,
             "val/mAP_50": map_50,
             "val/mAP_75": map_75,
@@ -366,8 +363,7 @@ def main(args):
             "val/FN": test_stats.get('fn', 0),
         }
         
-        # Log prediction visualizations to WandB
-        if vis_samples and epoch % 5 == 0:  # Every 5 epochs
+        if vis_samples and epoch % 5 == 0:
             wandb_images = []
             for i, (img, pred_boxes, pred_scores, gt_boxes) in enumerate(vis_samples[:8]):
                 wandb_img = visualize_predictions_wandb(img, pred_boxes, pred_scores, gt_boxes, epoch+1, i)
@@ -376,7 +372,6 @@ def main(args):
             if wandb_images:
                 log_dict["val/predictions"] = wandb_images
         
-        # Log confusion matrix to WandB
         confusion_matrix_img = create_confusion_matrix_wandb(
             test_stats.get('tp', 0),
             test_stats.get('fp', 0),
@@ -398,9 +393,8 @@ def main(args):
                 'map_50': map_50,
                 'map_avg': map_avg,
             }, best_checkpoint_path)
-            print(f"[INFO] ✓ Best model saved! mAP@50: {best_map:.4f}")
+            print(f"Best model saved! mAP@50: {best_map:.4f}")
         
-        # Save log
         log_stats = {
             **{f'train_{k}': v for k, v in train_stats.items()},
             **{f'test_{k}': v for k, v in test_stats.items()},
@@ -412,10 +406,8 @@ def main(args):
     
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('\n' + "="*80)
-    print(f'Training completed in {total_time_str}')
+    print(f'\nTraining completed in {total_time_str}')
     print(f'Best mAP@50: {best_map:.4f}')
-    print("="*80)
     
     wandb.finish()
 

@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-WSI Patch Extraction for Deformable DETR Training
-
-Extracts patches from Whole Slide Images (WSI) with annotations in COCO format.
-Compatible with the Deformable DETR training pipeline.
-
-Sampling strategy:
-- 45% real mitosis (class 0)
-- 45% mitosis look-alikes (class 1)  
-- 10% background tissue
-
-Uses focal loss compatible annotations with two classes for detection.
-Category IDs are 0-indexed for Deformable DETR compatibility.
-"""
-
 import argparse
 import json
 import os
@@ -26,11 +10,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-try:
-    import openslide
-except ImportError:
-    print("WARNING: openslide not available. Install with: pip install openslide-python")
-    openslide = None
+import openslide
 
 
 def parse_args():
@@ -118,7 +98,7 @@ def load_sqlite_annotations(db_path: str) -> Dict:
                 annotations_by_slide[slide_name]['hard_negatives'].append(bbox_data)
     
     conn.close()
-    print(f"[INFO] Loaded annotations for {len(annotations_by_slide)} slides from SQLite")
+    print(f"Loaded annotations for {len(annotations_by_slide)} slides from SQLite")
     return dict(annotations_by_slide)
 
 
@@ -172,7 +152,7 @@ def load_json_annotations(json_path: str) -> Dict:
                 elif agreed_class == 7:
                     annotations_by_slide[slide_name]['hard_negatives'].append(bbox_data)
     
-    print(f"[INFO] Loaded annotations for {len(annotations_by_slide)} slides from JSON")
+    print(f"Loaded annotations for {len(annotations_by_slide)} slides from JSON")
     return dict(annotations_by_slide)
 
 
@@ -203,7 +183,7 @@ def load_coco_format_annotations(data: Dict) -> Dict:
         else:
             annotations_by_slide[slide_name]['hard_negatives'].append(bbox_data)
     
-    print(f"[INFO] Loaded annotations for {len(annotations_by_slide)} images from COCO format")
+    print(f"Loaded annotations for {len(annotations_by_slide)} images from COCO format")
     return dict(annotations_by_slide)
 
 
@@ -583,10 +563,10 @@ def main():
         wsi_files.extend(wsi_dir.glob(f'*{ext}'))
         wsi_files.extend(wsi_dir.glob(f'*{ext.upper()}'))
     
-    print(f"[INFO] Found {len(wsi_files)} WSI files")
+    print(f"Found {len(wsi_files)} WSI files")
     
     if not wsi_files:
-        print("[ERROR] No WSI files found!")
+        print("No WSI files found!")
         return
     
     # Create output directories
@@ -610,7 +590,7 @@ def main():
                 break
         
         if not slide_annots:
-            print(f"[WARNING] No annotations found for slide: {slide_name}")
+            print(f"No annotations found for slide: {slide_name}")
             # Still extract background patches
             slide_annots = {'mitosis': [], 'lookalikes': [], 'hard_negatives': []}
         
@@ -621,7 +601,6 @@ def main():
             val_images, val_annotations
         )
     
-    # Save COCO annotations
     save_coco_annotations(args.output_dir, train_images, train_annotations, 'train')
     save_coco_annotations(args.output_dir, val_images, val_annotations, 'val')
     
